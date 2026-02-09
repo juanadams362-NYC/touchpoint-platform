@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# TouchPoint POC generated data
+attendance_log.json
+touchpoint_log.json
+
+# Node / Backend
+node_modules/
+.env
+
+# SQLite databases
+*.db
+
