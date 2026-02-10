@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Generated demo data
+attendance_log.json
+touchpoint_log.json
+
+# Node
+node_modules/
+.env
+
+# SQLite
+*.db
