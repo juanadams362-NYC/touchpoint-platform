@@ -1,0 +1,137 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>TouchPoint Admin</title>
+    <style>
+      body { font-family: Arial, sans-serif; padding: 16px; }
+      input, button, select { padding: 8px; margin-right: 8px; }
+      table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+      th, td { border: 1px solid #ddd; padding: 8px; }
+      th { background: #f5f5f5; text-align: left; }
+      .row { margin: 12px 0; }
+      code { background: #f2f2f2; padding: 2px 6px; border-radius: 4px; }
+      .pill { display:inline-block; padding:4px 8px; border-radius:999px; background:#eef; }
+    </style>
+  </head>
+  <body>
+    <h2>TouchPoint Admin (Milestone)</h2>
+
+    <div class="row">
+      Backend URL:
+      <input id="baseUrl" value="http://localhost:3001" size="30" />
+      <button onclick="refresh()">Refresh Logs</button>
+      <span id="status" class="pill">...</span>
+    </div>
+
+    <div class="row">
+      Device:
+      <input id="deviceId" value="DEVICE_001" />
+      Mode:
+      <select id="mode">
+        <option>ENTRY</option>
+        <option>ACCESS</option>
+        <option>CHECKIN</option>
+        <option>CHECKOUT</option>
+        <option>VISITOR</option>
+      </select>
+      <button onclick="setMode()">Set Mode</button>
+    </div>
+
+    <h3>Devices</h3>
+<table>
+  <thead>
+    <tr>
+      <th>Device ID</th>
+      <th>Current Mode</th>
+      <th>Last Seen</th>
+    </tr>
+  </thead>
+  <tbody id="devicesBody"></tbody>
+</table>
+
+
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Timestamp</th>
+          <th>Device</th>
+          <th>UID</th>
+          <th>Mode</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+
+    <script>
+      async function refresh() {
+  const base = document.getElementById("baseUrl").value.trim();
+  const status = document.getElementById("status");
+  status.textContent = "Loading...";
+
+  try {
+    // Logs
+    const res = await fetch(`${base}/api/logs?limit=25`);
+    const data = await res.json();
+    const tbody = document.getElementById("tbody");
+    tbody.innerHTML = "";
+    (data.rows || []).forEach(r => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${r.id}</td>
+        <td><code>${r.ts}</code></td>
+        <td>${r.device_id}</td>
+        <td><code>${r.uid}</code></td>
+        <td>${r.mode}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+
+    // Devices
+    const devRes = await fetch(`${base}/api/devices`);
+    const devData = await devRes.json();
+    const devicesBody = document.getElementById("devicesBody");
+    devicesBody.innerHTML = "";
+    (devData.rows || []).forEach(d => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${d.id}</td>
+        <td><b>${d.current_mode || ""}</b></td>
+        <td><code>${d.last_seen || ""}</code></td>
+      `;
+      devicesBody.appendChild(tr);
+    });
+
+    status.textContent = "OK";
+  } catch (e) {
+    status.textContent = "ERROR: " + e.message;
+  }
+}
+
+
+      async function setMode() {
+        const base = document.getElementById("baseUrl").value.trim();
+        const deviceId = document.getElementById("deviceId").value.trim();
+        const mode = document.getElementById("mode").value;
+        const status = document.getElementById("status");
+        status.textContent = "Setting mode...";
+        try {
+          const res = await fetch(`${base}/api/device/mode`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ deviceId, mode })
+          });
+          const data = await res.json();
+          status.textContent = data.ok ? `Mode set: ${mode}` : `ERROR: ${data.error}`;
+          refresh(); // Refresh the UI to show updated device mode
+        } catch (e) {
+          status.textContent = "ERROR: " + e.message;
+        }
+      }
+
+      refresh();
+      setInterval(refresh, 1500);
+    </script>
+  </body>
+</html>
