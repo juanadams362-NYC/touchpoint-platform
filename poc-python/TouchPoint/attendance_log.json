@@ -1,0 +1,48 @@
+{
+  "events": [
+    {
+      "timestamp": "2026-02-04 20:47:22",
+      "student_id": "S1002",
+      "student_name": "Maya Rivera",
+      "scenario": "Normal (has tag + on wifi)",
+      "status": "approved"
+    },
+    {
+      "timestamp": "2026-02-04 20:48:34",
+      "student_id": "S1001",
+      "student_name": "Alex Johnson",
+      "scenario": "Normal (has tag + on wifi)",
+      "status": "approved"
+    },
+    {
+      "timestamp": "2026-02-04 20:48:49",
+      "student_id": "S1001",
+      "student_name": "Alex Johnson",
+      "scenario": "Missing Tag",
+      "status": "approved",
+      "approved_at": "2026-02-04 20:49:01"
+    },
+    {
+      "timestamp": "2026-02-04 20:49:41",
+      "student_id": "S1001",
+      "student_name": "Alex Johnson",
+      "scenario": "No Wi-Fi (cellular only)",
+      "status": "pending"
+    },
+    {
+      "timestamp": "2026-02-04 20:50:11",
+      "student_id": "S1001",
+      "student_name": "Alex Johnson",
+      "scenario": "No Wi-Fi (cellular only)",
+      "status": "pending"
+    },
+    {
+      "timestamp": "2026-02-04 20:50:52",
+      "student_id": "S1001",
+      "student_name": "Alex Johnson",
+      "scenario": "Missing Tag",
+      "status": "approved",
+      "approved_at": "2026-02-04 20:50:56"
+    }
+  ]
+}
