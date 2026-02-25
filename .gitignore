@@ -12,3 +12,8 @@ node_modules/
 
 # SQLite
 *.db
+
+# SQLite databases
+*.sqlite
+backend/touchpoint_m3.sqlite
+
