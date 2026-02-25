@@ -1,530 +1,496 @@
-const express = require("express");
-const cors = require("cors");
-const jwt = require("jsonwebtoken");
-const bcrypt = require("bcryptjs");
-const db = require("./db");
+import express from "express";
+import cors from "cors";
+import crypto from "crypto";
+import bcrypt from "bcryptjs";
+import { EventEmitter } from "events";
+import { db } from "./db.js";
+
+import jwt from "jsonwebtoken";
+
+const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
+
+const JWT_EXPIRES_IN = "7d";
 
 const app = express();
-app.use(cors());
+const PORT = 3001;
+app.use(cors({ origin: true }));
 app.use(express.json());
 
-const PORT = 3001;
-const JWT_SECRET = "Change_this_secret_tonight";
+// Minimal login: accepts { email, password }
+// For tonight, if password isn't stored, allow a demo password "demo123" OR blank password if user has no hash.
+app.post("/api/auth/login", (req, res) => {
+  const { email, password } = req.body ?? {};
+  if (!email) return res.status(400).json({ ok: false, error: "Missing email" });
 
-function isFullSailStaff(email) {
-  const e = String(email || "").toLowerCase().trim();
-  return e.endsWith("@fullsail.edu");
-}
+  const user = db.prepare(`SELECT * FROM users WHERE email=?`).get(String(email).toLowerCase());
+  if (!user) return res.status(401).json({ ok: false, error: "Invalid credentials" });
 
-function requireAuth(req, res, next) {
-  const header = req.headers.authorization || "";
-  const [type, token] = header.split(" ");
-  if (type !== "Bearer" || !token) {
-    return res.status(401).json({ ok: false, error: "Missing token" });
+  // If password hashes, store them in users.password_hash (recommended).
+  // If not, tonight-mode fallback: accept "demo123".
+  let valid = false;
+  const hasHash = !!user.password_hash;
+
+  if (hasHash) {
+    valid = bcrypt.compareSync(String(password || ""), user.password_hash);
+  } else {
+    valid = (String(password || "") === "demo123");
   }
+
+  if (!valid) return res.status(401).json({ ok: false, error: "Invalid credentials" });
+
+  const token = jwt.sign(
+    { sub: user.id, role: user.role, subrole: user.subrole || null },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES_IN }
+  );
+
+  res.json({
+    ok: true,
+    token,
+    user: {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      subrole: user.subrole || null,
+      name: user.name,
+      studentId: user.student_id
+    }
+  });
+});
+
+// Optional: "who am I" endpoint for your web to validate token
+app.get("/api/auth/me", (req, res) => {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ ok: false, error: "Missing token" });
+
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
+    const payload = jwt.verify(token, JWT_SECRET);
+    const user = db.prepare(`SELECT id,email,role,subrole,name,student_id as studentId FROM users WHERE id=?`).get(payload.sub);
+    if (!user) return res.status(401).json({ ok: false, error: "Invalid token" });
+    res.json({ ok: true, user });
   } catch {
     return res.status(401).json({ ok: false, error: "Invalid token" });
   }
+});
+
+/** ---------------- REALTIME BUS ---------------- */
+const bus = new EventEmitter();
+bus.setMaxListeners(200);
+
+function sseSend(res, eventName, data) {
+  res.write(`event: ${eventName}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-function requireRole(roles) {
-  return (req, res, next) => {
-    const r = String(req.user?.role || "").toLowerCase();
-    const ok = roles.map((x) => String(x).toLowerCase()).includes(r);
-    if (!ok) return res.status(403).json({ ok: false, error: "Forbidden" });
-    next();
+/** ---------------- SSE: per session ----------------
+ * Web listens to: /api/stream/sessions/:sessionId
+ */
+app.get("/api/stream/sessions/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  sseSend(res, "heartbeat", { type: "heartbeat", ts: new Date().toISOString() });
+
+  const hb = setInterval(() => {
+    sseSend(res, "heartbeat", { type: "heartbeat", ts: new Date().toISOString() });
+  }, 25000);
+
+  const onTap = (payload) => {
+    if (payload.sessionId !== sessionId) return;
+    sseSend(res, "tap", payload);
   };
-}
 
-// Health
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true, service: "touchpoint-backend", ts: new Date().toISOString() });
+  const onAttendance = (payload) => {
+    if (payload.sessionId !== sessionId) return;
+    sseSend(res, "attendance_updated", payload);
+  };
+
+  bus.on("tap", onTap);
+  bus.on("attendance_updated", onAttendance);
+
+  req.on("close", () => {
+    clearInterval(hb);
+    bus.off("tap", onTap);
+    bus.off("attendance_updated", onAttendance);
+    res.end();
+  });
 });
 
-// ---------------- AUTH ----------------
+/** ---------------- ADMIN HELPERS (for tonight) ----------------
+ * These endpoints let you create demo data without building admin UI yet.
+ */
 
-// Register
-app.post("/api/auth/register", async (req, res) => {
-  const { email, password, role, fullName, studentId, orgCode } = req.body || {};
-  if (!email || !password || !role) {
-    return res.status(400).json({ ok: false, error: "email, password, role required" });
+// Create demo class
+app.post("/api/admin/classes", (req, res) => {
+  const id = crypto.randomUUID();
+  const { name = "Demo Class", term = "Spring 2026" } = req.body ?? {};
+  db.prepare(`INSERT INTO classes (id, name, term) VALUES (?,?,?)`).run(id, name, term);
+  res.json({ ok: true, class: { id, name, term } });
+});
+
+// Create open session (window around now)
+app.post("/api/admin/classes/:classId/sessions/open", (req, res) => {
+  const { classId } = req.params;
+  const id = crypto.randomUUID();
+
+  const now = Date.now();
+  const starts = new Date(now - 5 * 60_000).toISOString();
+  const ends = new Date(now + 55 * 60_000).toISOString();
+  const open = new Date(now - 10 * 60_000).toISOString();
+  const close = new Date(now + 60 * 60_000).toISOString();
+
+  const lateGraceMinutes = Number(req.body?.lateGraceMinutes ?? 20);
+
+  db.prepare(
+    `INSERT INTO class_sessions
+     (id, class_id, starts_at, ends_at, checkin_open_at, checkin_close_at, late_grace_minutes, status)
+     VALUES (?,?,?,?,?,?,?, 'open')`
+  ).run(id, classId, starts, ends, open, close, lateGraceMinutes);
+
+  res.json({ ok: true, session: { id, classId } });
+});
+
+// Create student + enroll
+app.post("/api/admin/classes/:classId/enroll-student", (req, res) => {
+  const { classId } = req.params;
+  const { name, email, studentId } = req.body ?? {};
+  const id = crypto.randomUUID();
+
+  db.prepare(
+    `INSERT INTO users (id, email, role, name, student_id) VALUES (?,?,?,?,?)`
+  ).run(id, email ?? `${id}@demo.local`, "student", name ?? "Student", studentId ?? `S-${id.slice(0,6)}`);
+
+  db.prepare(
+    `INSERT INTO enrollments (class_id, student_id, status) VALUES (?,?, 'active')`
+  ).run(classId, id);
+
+  res.json({ ok: true, student: { id } });
+});
+
+app.post("/api/admin/users/demo", (req, res) => {
+  const id = crypto.randomUUID();
+  const email = "admin@demo.local";
+  db.prepare(
+    `INSERT INTO users (id,email,role,name) VALUES (?,?,?,?)`
+  ).run(id, email, "admin", "Demo Admin");
+  res.json({ ok: true, email, password: "demo123" });
+});
+
+app.post("/api/admin/migrate/add-password", (req, res) => {
+  try {
+    db.prepare(`ALTER TABLE users ADD COLUMN password_hash TEXT`).run();
+    res.json({ ok: true, message: "password_hash column added" });
+  } catch (err) {
+    res.json({ ok: false, error: err.message });
   }
-
-  const ROLE = String(role).trim();
-  const EMAIL = String(email).toLowerCase().trim();
-  const isStaffRole = ["instructor", "admin"].includes(ROLE.toLowerCase());
-
-  if (isStaffRole && !isFullSailStaff(EMAIL)) {
-    return res.status(403).json({
-      ok: false,
-      error: "Instructor/Admin must register with a @fullsail.edu email for this milestone demo."
-    });
-  }
-
-  const hash = await bcrypt.hash(password, 10);
-  const createdAt = new Date().toISOString();
-
-  db.run(
-    `INSERT INTO users (email, password_hash, role, full_name, student_id, org_code, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [EMAIL, hash, ROLE, fullName || null, studentId || null, orgCode || null, createdAt],
-    function (err) {
-      if (err) {
-        if (err.message.includes("UNIQUE")) {
-          return res.status(409).json({ ok: false, error: "Email already exists" });
-        }
-        return res.status(500).json({ ok: false, error: err.message });
-      }
-
-      const user = { id: this.lastID, email: EMAIL, role: ROLE };
-      const token = jwt.sign(user, JWT_SECRET, { expiresIn: "2h" });
-      res.json({ ok: true, token, user });
-    }
-  );
 });
 
-// Login
-app.post("/api/auth/login", (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) {
-    return res.status(400).json({ ok: false, error: "email and password required" });
-  }
-
-  const EMAIL = String(email).toLowerCase().trim();
-
-  db.get(`SELECT * FROM users WHERE email = ?`, [EMAIL], async (err, row) => {
-    if (err) return res.status(500).json({ ok: false, error: err.message });
-    if (!row) return res.status(401).json({ ok: false, error: "Invalid credentials" });
-
-    const match = await bcrypt.compare(password, row.password_hash);
-    if (!match) return res.status(401).json({ ok: false, error: "Invalid credentials" });
-
-    const user = { id: row.id, email: row.email, role: row.role };
-    const token = jwt.sign(user, JWT_SECRET, { expiresIn: "2h" });
-    res.json({ ok: true, token, user });
-  });
+// Link UID to student (auto-link simulation)
+app.post("/api/admin/students/:studentId/link-uid", (req, res) => {
+  const { studentId } = req.params;
+  const { uid, label = "card" } = req.body ?? {};
+  const id = crypto.randomUUID();
+  db.prepare(`INSERT OR REPLACE INTO student_uids (id, student_id, uid, label, active) VALUES (?,?,?,?,1)`)
+    .run(id, studentId, uid, label);
+  res.json({ ok: true });
 });
 
-// ---------------- PROFILE (NEW) ----------------
+/** ---------------- SESSION API (web uses these) ---------------- */
 
-// Get my profile (frontend uses this to see if student has NFC linked)
-app.get("/api/me", requireAuth, (req, res) => {
-  db.get(
-    `SELECT id, email, role, full_name, student_id, org_code
-     FROM users WHERE id = ?`,
-    [req.user.id],
-    (err, row) => {
-      if (err) return res.status(500).json({ ok: false, error: err.message });
-      res.json({ ok: true, me: row });
-    }
-  );
+app.get("/api/classes", (req, res) => {
+  const rows = db.prepare(`SELECT * FROM classes ORDER BY name ASC`).all();
+  res.json({ ok: true, classes: rows });
 });
 
-// Student links their NFC UID to their profile (one-time setup)
-app.post("/api/me/link-nfc", requireAuth, requireRole(["Student"]), (req, res) => {
-  const { uid } = req.body || {};
-  if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
-
-  const UID = String(uid).toUpperCase().trim();
-
-  // Prevent same UID being assigned to multiple users
-  db.get(`SELECT id, email FROM users WHERE nfc_uid = ?`, [UID], (err, existing) => {
-    if (err) return res.status(500).json({ ok: false, error: err.message });
-    if (existing && existing.id !== req.user.id) {
-      return res.status(409).json({ ok: false, error: "That NFC UID is already linked to another account." });
-    }
-
-    db.run(
-      `UPDATE users SET nfc_uid = ? WHERE id = ?`,
-      [UID, req.user.id],
-      (err2) => {
-        if (err2) return res.status(500).json({ ok: false, error: err2.message });
-        res.json({ ok: true, uid: UID });
-      }
-    );
-  });
+app.get("/api/classes/:classId/sessions/open", (req, res) => {
+  const { classId } = req.params;
+  const row = db.prepare(
+    `SELECT * FROM class_sessions WHERE class_id=? AND status='open' ORDER BY checkin_open_at DESC LIMIT 1`
+  ).get(classId);
+  res.json({ ok: true, session: row ?? null });
 });
 
-// Optional: student can unlink their own UID (lost card scenario)
-// If you don't want this, delete this route.
-app.post("/api/me/unlink-nfc", requireAuth, requireRole(["Student"]), (req, res) => {
-  db.run(`UPDATE users SET nfc_uid = NULL WHERE id = ?`, [req.user.id], (err) => {
-    if (err) return res.status(500).json({ ok: false, error: err.message });
-    res.json({ ok: true });
-  });
+app.get("/api/sessions/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  const session = db.prepare(`SELECT * FROM class_sessions WHERE id=?`).get(sessionId);
+  if (!session) return res.status(404).json({ ok: false, error: "Session not found" });
+
+  const total = db.prepare(`SELECT COUNT(*) as c FROM enrollments WHERE class_id=?`).get(session.class_id).c;
+  const present = db.prepare(
+    `SELECT COUNT(*) as c FROM attendance_records WHERE class_session_id=? AND status IN ('present','late')`
+  ).get(sessionId).c;
+
+  res.json({ ok: true, session, progress: { presentOrLate: present, totalEnrolled: total } });
 });
 
-// Optional: staff can reset a student's UID (admin/instructor helpdesk)
-// If you don't want this, delete this route.
-app.post("/api/admin/reset-nfc", requireAuth, requireRole(["Instructor", "Admin"]), (req, res) => {
-  const { userId } = req.body || {};
-  if (!userId) return res.status(400).json({ ok: false, error: "userId required" });
-
-  db.run(`UPDATE users SET nfc_uid = NULL WHERE id = ?`, [userId], (err) => {
-    if (err) return res.status(500).json({ ok: false, error: err.message });
-    res.json({ ok: true });
-  });
+app.patch("/api/sessions/:sessionId/late", (req, res) => {
+  const { sessionId } = req.params;
+  const lateGraceMinutes = Number(req.body?.lateGraceMinutes ?? 0);
+  db.prepare(`UPDATE class_sessions SET late_grace_minutes=? WHERE id=?`).run(lateGraceMinutes, sessionId);
+  const session = db.prepare(`SELECT * FROM class_sessions WHERE id=?`).get(sessionId);
+  res.json({ ok: true, session });
 });
 
-// ---------------- TAP + EVENTS ----------------
+app.get("/api/roster/sessions/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  const session = db.prepare(`SELECT * FROM class_sessions WHERE id=?`).get(sessionId);
+  if (!session) return res.status(404).json({ ok: false, error: "Session not found" });
 
-// Protected: last 50 tap events (JWT)
-app.get("/api/events", requireAuth, (req, res) => {
-  db.all(`SELECT * FROM tap_events ORDER BY ts DESC LIMIT 50`, [], (err, rows) => {
-    if (err) return res.status(500).json({ ok: false, error: err.message });
-    res.json({ ok: true, events: rows });
-  });
-});
-
-// ESP32 -> backend tap endpoint (raw log)
-app.post("/api/tap", (req, res) => {
-  const { deviceId, uid, mode } = req.body || {};
-  if (!deviceId || !uid || !mode) {
-    return res.status(400).json({ ok: false, error: "deviceId, uid, and mode are required" });
-  }
-
-  const ts = new Date().toISOString();
-  const UID = String(uid).toUpperCase();
-  const MODE = String(mode).toUpperCase();
-
-  db.run(
-    `
-    INSERT INTO devices (id, name, current_mode, last_seen)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      current_mode=excluded.current_mode,
-      last_seen=excluded.last_seen
-    `,
-    [deviceId, deviceId, MODE, ts],
-    (err) => {
-      if (err) return res.status(500).json({ ok: false, error: err.message });
-
-      db.run(
-        `INSERT INTO tap_events (device_id, uid, mode, ts) VALUES (?, ?, ?, ?)`,
-        [deviceId, UID, MODE, ts],
-        function (err2) {
-          if (err2) return res.status(500).json({ ok: false, error: err2.message });
-          res.json({ ok: true, eventId: this.lastID, ts, deviceId, uid: UID, mode: MODE });
-        }
-      );
-    }
-  );
-});
-
-// Admin-ish logs (demo)
-app.get("/api/logs", (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || "25", 10), 200);
-  db.all(
-    `SELECT id, device_id, uid, mode, ts FROM tap_events ORDER BY id DESC LIMIT ?`,
-    [limit],
-    (err, rows) => {
-      if (err) return res.status(500).json({ ok: false, error: err.message });
-      res.json({ ok: true, rows });
-    }
-  );
-});
-
-// Optional: change device mode
-app.post("/api/device/mode", (req, res) => {
-  const { deviceId, mode } = req.body || {};
-  if (!deviceId || !mode) return res.status(400).json({ ok: false, error: "deviceId and mode are required" });
-
-  const ts = new Date().toISOString();
-  const MODE = String(mode).toUpperCase();
-
-  db.run(
-    `
-    INSERT INTO devices (id, name, current_mode, last_seen)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      current_mode=excluded.current_mode,
-      last_seen=excluded.last_seen
-    `,
-    [deviceId, deviceId, MODE, ts],
-    (err) => {
-      if (err) return res.status(500).json({ ok: false, error: err.message });
-      res.json({ ok: true, deviceId, mode: MODE, ts });
-    }
-  );
-});
-
-app.get("/api/device/:id", (req, res) => {
-  const id = req.params.id;
-  db.get(`SELECT id, current_mode, last_seen FROM devices WHERE id = ?`, [id], (err, row) => {
-    if (err) return res.status(500).json({ ok: false, error: err.message });
-    if (!row) return res.json({ ok: true, id, current_mode: "ENTRY" });
-    res.json({ ok: true, ...row });
-  });
-});
-
-app.get("/api/devices", (req, res) => {
-  db.all(
-    `SELECT id, name, current_mode, last_seen
-     FROM devices
-     ORDER BY COALESCE(last_seen, '') DESC`,
-    [],
-    (err, rows) => {
-      if (err) return res.status(500).json({ ok: false, error: err.message });
-      res.json({ ok: true, rows });
-    }
-  );
-});
-
-// ----------------- Attendance Module -----------------
-
-async function ensureDemoClass(instructorUserId) {
-  const now = new Date().toISOString();
-  const org = "FULLSAIL";
-  const code = "COS349-L";
-
-  return new Promise((resolve, reject) => {
-    db.get(`SELECT * FROM classes WHERE org_code = ? AND class_code = ?`, [org, code], (err, row) => {
-      if (err) return reject(err);
-      if (row) return resolve(row);
-
-      db.run(
-        `INSERT INTO classes (org_code, class_code, title, location, start_time, end_time, instructor_user_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [org, code, "COS349-L (Demo)", "Full Sail", "14:00", "16:00", instructorUserId, now],
-        function (err2) {
-          if (err2) return reject(err2);
-          db.get(`SELECT * FROM classes WHERE id = ?`, [this.lastID], (err3, created) => {
-            if (err3) return reject(err3);
-            resolve(created);
-          });
-        }
-      );
-    });
-  });
-}
-
-// Create or ensure class (Instructor/Admin)
-app.post("/api/classes/create", requireAuth, requireRole(["Instructor", "Admin"]), (req, res) => {
-  const { orgCode, classCode, title, location, startTime, endTime } = req.body || {};
-  const org = String(orgCode || "FULLSAIL").toUpperCase();
-  const code = String(classCode || "COS349-L").toUpperCase();
-  const now = new Date().toISOString();
-
-  db.run(
-    `INSERT OR IGNORE INTO classes (org_code, class_code, title, location, start_time, end_time, instructor_user_id, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [org, code, title || "Demo Class", location || "Room TBD", startTime || "14:00", endTime || "16:00", req.user.id, now],
-    (err) => {
-      if (err) return res.status(500).json({ ok: false, error: err.message });
-      db.get(`SELECT * FROM classes WHERE org_code = ? AND class_code = ?`, [org, code], (err2, row) => {
-        if (err2) return res.status(500).json({ ok: false, error: err2.message });
-        res.json({ ok: true, class: row });
-      });
-    }
-  );
-});
-
-// Student join class by code
-app.post("/api/classes/join", requireAuth, requireRole(["Student"]), (req, res) => {
-  const { orgCode, classCode } = req.body || {};
-  const org = String(orgCode || "").toUpperCase().trim();
-  const code = String(classCode || "").toUpperCase().trim();
-  if (!org || !code) return res.status(400).json({ ok: false, error: "orgCode and classCode required" });
-
-  db.get(`SELECT * FROM classes WHERE org_code = ? AND class_code = ?`, [org, code], (err, cls) => {
-    if (err) return res.status(500).json({ ok: false, error: err.message });
-    if (!cls) return res.status(404).json({ ok: false, error: "Class not found" });
-
-    const now = new Date().toISOString();
-    db.run(
-      `INSERT OR IGNORE INTO enrollments (class_id, user_id, created_at) VALUES (?, ?, ?)`,
-      [cls.id, req.user.id, now],
-      (err2) => {
-        if (err2) return res.status(500).json({ ok: false, error: err2.message });
-        res.json({ ok: true, class: cls });
-      }
-    );
-  });
-});
-
-// Get my classes
-app.get("/api/classes/my", requireAuth, (req, res) => {
-  const role = String(req.user.role || "").toLowerCase();
-
-  if (role === "student") {
-    db.all(
-      `SELECT c.* FROM classes c
-       JOIN enrollments e ON e.class_id = c.id
-       WHERE e.user_id = ?
-       ORDER BY c.id DESC`,
-      [req.user.id],
-      (err, rows) => {
-        if (err) return res.status(500).json({ ok: false, error: err.message });
-        res.json({ ok: true, classes: rows });
-      }
-    );
-    return;
-  }
-
-  db.all(
-    `SELECT * FROM classes WHERE instructor_user_id = ? ORDER BY id DESC`,
-    [req.user.id],
-    async (err, rows) => {
-      if (err) return res.status(500).json({ ok: false, error: err.message });
-      if (rows.length === 0) {
-        try {
-          const demo = await ensureDemoClass(req.user.id);
-          return res.json({ ok: true, classes: [demo] });
-        } catch (e) {
-          return res.status(500).json({ ok: false, error: String(e.message || e) });
-        }
-      }
-      res.json({ ok: true, classes: rows });
-    }
-  );
-});
-
-// Instructor roster
-app.get("/api/roster/:classId", requireAuth, requireRole(["Instructor", "Admin"]), (req, res) => {
-  const classId = parseInt(req.params.classId, 10);
-  db.all(
-    `SELECT u.id, u.full_name, u.student_id, u.email, u.nfc_uid
+  const roster = db.prepare(
+    `SELECT
+       u.id as studentId,
+       u.name,
+       u.student_id as studentNumber,
+       u.photo_url as photoUrl,
+       COALESCE(ar.status, 'absent') as status,
+       ar.checked_in_at as checkedInAt
      FROM enrollments e
-     JOIN users u ON u.id = e.user_id
-     WHERE e.class_id = ?
-     ORDER BY COALESCE(u.full_name, u.email) ASC`,
-    [classId],
-    (err, rows) => {
-      if (err) return res.status(500).json({ ok: false, error: err.message });
-      res.json({ ok: true, roster: rows });
-    }
-  );
+     JOIN users u ON u.id = e.student_id
+     LEFT JOIN attendance_records ar
+       ON ar.student_id=u.id AND ar.class_session_id=?
+     WHERE e.class_id=?
+     ORDER BY u.name ASC`
+  ).all(sessionId, session.class_id);
+
+  res.json({ ok: true, roster });
 });
 
-// Student requests check-in (ONLY allowed if student has NO nfc_uid)
-app.post("/api/attendance/request", requireAuth, requireRole(["Student"]), (req, res) => {
-  const { classId, reason } = req.body || {};
-  if (!classId) return res.status(400).json({ ok: false, error: "classId required" });
+/** ---------------- DEVICE ACTIVATION + AUTH ---------------- */
 
-  db.get(`SELECT nfc_uid FROM users WHERE id = ?`, [req.user.id], (err, u) => {
-    if (err) return res.status(500).json({ ok: false, error: err.message });
+function randomCode(len = 6) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+function makeDeviceKey() {
+  return `tp_devkey_${crypto.randomBytes(24).toString("hex")}`;
+}
 
-    const hasNfc = !!u?.nfc_uid;
-    if (hasNfc) {
-      return res.status(409).json({
-        ok: false,
-        error: "NFC is linked to your account. Use Tap to Check In instead of requesting."
-      });
-    }
+// Admin start activation (for tonight: no auth, just use it)
+app.post("/api/devices/activate/start", (req, res) => {
+  const deviceId = crypto.randomUUID();
+  const { name="Door Reader", locationLabel="Room 204", assignedClassId=null } = req.body ?? {};
 
-    const now = new Date().toISOString();
-    db.run(
-      `INSERT INTO pending_approvals (class_id, user_id, requested_at, reason, status)
-       VALUES (?, ?, ?, ?, 'PENDING')`,
-      [classId, req.user.id, now, reason || "Demo request"],
-      function (err2) {
-        if (err2) return res.status(500).json({ ok: false, error: err2.message });
-        res.json({ ok: true, requestId: this.lastID, requested_at: now });
-      }
+  db.prepare(`INSERT INTO devices (id,name,location_label,assigned_class_id,status) VALUES (?,?,?,?, 'active')`)
+    .run(deviceId, name, locationLabel, assignedClassId);
+
+  const code = randomCode(6);
+  const id = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + 10*60*1000).toISOString();
+
+  db.prepare(`INSERT INTO device_activation_codes (id, code, expires_at, device_id) VALUES (?,?,?,?)`)
+    .run(id, code, expiresAt, deviceId);
+
+  res.json({ ok:true, code, expiresAt, deviceId });
+});
+
+// Device claim activation
+app.post("/api/devices/activate/claim", (req, res) => {
+  const { code } = req.body ?? {};
+  if (!code) return res.status(400).json({ ok:false, error:"Missing code" });
+
+  const row = db.prepare(`SELECT * FROM device_activation_codes WHERE code=?`).get(String(code));
+  if (!row) return res.status(404).json({ ok:false, error:"Invalid code" });
+  if (row.claimed_at) return res.status(409).json({ ok:false, error:"Already claimed" });
+  if (new Date(row.expires_at) < new Date()) return res.status(410).json({ ok:false, error:"Expired" });
+
+  const deviceKey = makeDeviceKey();
+  const keyHash = bcrypt.hashSync(deviceKey, 10);
+
+  db.prepare(`UPDATE device_activation_codes SET claimed_at=? WHERE id=?`).run(new Date().toISOString(), row.id);
+  db.prepare(`INSERT OR REPLACE INTO device_keys (device_id, key_hash) VALUES (?,?)`).run(row.device_id, keyHash);
+
+  res.json({ ok:true, device: { id: row.device_id }, deviceKey });
+});
+
+// Device auth middleware for /api/tap
+function requireDevice(req, res, next) {
+  const deviceId = req.headers["x-device-id"];
+  const auth = req.headers["authorization"] || "";
+  const deviceKey = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+
+  if (!deviceId || !deviceKey) return res.status(401).json({ ok:false, error:"Missing device auth" });
+
+  const keyRow = db.prepare(`SELECT * FROM device_keys WHERE device_id=?`).get(String(deviceId));
+  if (!keyRow) return res.status(401).json({ ok:false, error:"Unknown device" });
+
+  const ok = bcrypt.compareSync(String(deviceKey), keyRow.key_hash);
+  if (!ok) return res.status(401).json({ ok:false, error:"Bad device key" });
+
+  const device = db.prepare(`SELECT * FROM devices WHERE id=?`).get(String(deviceId));
+  if (!device || device.status !== "active") return res.status(403).json({ ok:false, error:"Device disabled" });
+
+  req.device = device;
+  next();
+}
+app.post("/api/auth/register", (req, res) => {
+  const { email, password, name, role = "student", studentId, subrole = null } = req.body ?? {};
+
+  if (!email || !password) {
+    return res.status(400).json({ ok: false, error: "Missing email or password" });
+  }
+
+  const normalizedEmail = String(email).toLowerCase().trim();
+
+  // Prevent duplicate email
+  const existing = db.prepare(`SELECT id FROM users WHERE email=?`).get(normalizedEmail);
+  if (existing) return res.status(409).json({ ok: false, error: "Email already registered" });
+
+  const id = crypto.randomUUID();
+  const passwordHash = bcrypt.hashSync(String(password), 10);
+
+  // Try insert with password_hash + subrole (if your schema has them)
+  try {
+    db.prepare(
+      `INSERT INTO users (id, email, role, subrole, name, student_id, password_hash)
+       VALUES (?,?,?,?,?,?,?)`
+    ).run(
+      id,
+      normalizedEmail,
+      role,
+      subrole,
+      name ?? "User",
+      studentId ?? null,
+      passwordHash
     );
+  } catch (err) {
+    // Fallback if your users table doesn't have password_hash or subrole yet
+    try {
+      db.prepare(
+        `INSERT INTO users (id, email, role, name, student_id)
+         VALUES (?,?,?,?,?)`
+      ).run(
+        id,
+        normalizedEmail,
+        role,
+        name ?? "User",
+        studentId ?? null
+      );
+    } catch (err2) {
+      return res.status(500).json({ ok: false, error: err2.message });
+    }
+  }
+
+  // Issue token immediately after register (common frontend expectation)
+  const token = jwt.sign({ sub: id, role }, JWT_SECRET, { expiresIn: "7d" });
+
+  res.json({
+    ok: true,
+    token,
+    user: { id, email: normalizedEmail, role, subrole, name: name ?? "User", studentId: studentId ?? null }
   });
 });
 
-// Instructor sees pending
-app.get("/api/attendance/pending", requireAuth, requireRole(["Instructor", "Admin"]), (req, res) => {
-  db.all(
-    `SELECT p.id, p.class_id, p.user_id, p.requested_at, p.reason, p.status,
-            u.full_name, u.student_id, u.email,
-            c.org_code, c.class_code, c.title
-     FROM pending_approvals p
-     JOIN users u ON u.id = p.user_id
-     JOIN classes c ON c.id = p.class_id
-     WHERE p.status = 'PENDING'
-     ORDER BY p.requested_at DESC
-     LIMIT 50`,
-    [],
-    (err, rows) => {
-      if (err) return res.status(500).json({ ok: false, error: err.message });
-      res.json({ ok: true, pending: rows });
-    }
-  );
-});
+/** ---------------- TAP -> ATTENDANCE + SSE ---------------- */
+app.post("/api/tap", requireDevice, (req, res) => {
+  const { uid, mode="A" } = req.body ?? {};
+  if (!uid) return res.status(400).json({ ok:false, error:"Missing uid" });
 
-// Instructor approves/rejects
-app.post("/api/attendance/review", requireAuth, requireRole(["Instructor", "Admin"]), (req, res) => {
-  const { requestId, decision, note } = req.body || {};
-  if (!requestId || !decision) return res.status(400).json({ ok: false, error: "requestId and decision required" });
+  const device = req.device;
+  const tappedAt = new Date().toISOString();
 
-  const DEC = String(decision).toUpperCase(); // APPROVE / REJECT
-  if (!["APPROVE", "REJECT"].includes(DEC)) return res.status(400).json({ ok: false, error: "decision must be APPROVE or REJECT" });
+  // Find active session for device.assigned_class_id
+  let session = null;
+  if (device.assigned_class_id) {
+    session = db.prepare(
+      `SELECT * FROM class_sessions
+       WHERE class_id=?
+         AND status='open'
+         AND checkin_open_at <= ?
+         AND checkin_close_at >= ?
+       ORDER BY checkin_open_at DESC
+       LIMIT 1`
+    ).get(device.assigned_class_id, tappedAt, tappedAt);
+  }
 
-  const reviewedAt = new Date().toISOString();
-  const newStatus = DEC === "APPROVE" ? "APPROVED" : "REJECTED";
+  const sessionId = session?.id ?? null;
 
-  db.get(`SELECT * FROM pending_approvals WHERE id = ?`, [requestId], (err, reqRow) => {
-    if (err) return res.status(500).json({ ok: false, error: err.message });
-    if (!reqRow) return res.status(404).json({ ok: false, error: "Request not found" });
+  // Find student by UID
+  const uidRow = db.prepare(`SELECT student_id FROM student_uids WHERE uid=? AND active=1`).get(uid);
+  const studentId = uidRow?.student_id ?? null;
 
-    db.run(
-      `UPDATE pending_approvals
-       SET status = ?, reviewed_by_user_id = ?, reviewed_at = ?
-       WHERE id = ?`,
-      [newStatus, req.user.id, reviewedAt, requestId],
-      (err2) => {
-        if (err2) return res.status(500).json({ ok: false, error: err2.message });
+  let resolvedStatus = "unknown_uid";
+  if (!sessionId) resolvedStatus = "no_active_session";
+  if (sessionId && studentId) resolvedStatus = "matched_student";
+  if (!sessionId && studentId) resolvedStatus = "matched_student_no_session";
 
-        if (newStatus === "APPROVED") {
-          db.run(
-            `INSERT INTO attendance_records (class_id, user_id, status, source, ts, note)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [reqRow.class_id, reqRow.user_id, "VERIFIED", "REQUEST", reviewedAt, note || "Approved by instructor"],
-            function (err3) {
-              if (err3) return res.status(500).json({ ok: false, error: err3.message });
-              return res.json({ ok: true, status: newStatus, attendanceRecordId: this.lastID });
-            }
-          );
-        } else {
-          return res.json({ ok: true, status: newStatus });
-        }
-      }
-    );
+  const tapEventId = crypto.randomUUID();
+  db.prepare(
+    `INSERT INTO tap_events (id, device_id, uid, mode, tapped_at, class_session_id, resolved_status, resolved_student_id)
+     VALUES (?,?,?,?,?,?,?,?)`
+  ).run(tapEventId, device.id, uid, mode, tappedAt, sessionId, resolvedStatus, studentId);
+
+  db.prepare(`UPDATE devices SET last_seen_at=? WHERE id=?`).run(tappedAt, device.id);
+
+  // Emit tap event (so UI shows it immediately)
+  bus.emit("tap", {
+    type: "tap",
+    tapEventId,
+    sessionId,
+    uid,
+    mode,
+    tappedAt,
+    device: { id: device.id, name: device.name, location: device.location_label },
+    resolution: { status: resolvedStatus },
+    student: studentId
+      ? db.prepare(`SELECT id, name, student_id as studentNumber, photo_url as photoUrl FROM users WHERE id=?`).get(studentId)
+      : null
   });
+
+  // If we can count attendance
+  if (sessionId && studentId) {
+    const grace = Number(session.late_grace_minutes ?? 0);
+    const startMs = new Date(session.starts_at).getTime();
+    const tapMs = new Date(tappedAt).getTime();
+    const lateCutoff = startMs + grace * 60_000;
+    const status = tapMs <= lateCutoff ? "present" : "late";
+
+    // Upsert attendance
+    const existing = db.prepare(
+      `SELECT id FROM attendance_records WHERE class_session_id=? AND student_id=?`
+    ).get(sessionId, studentId);
+
+    if (!existing) {
+  db.prepare(
+    `INSERT INTO attendance_records (id, class_session_id, student_id, status, source, checked_in_at)
+     VALUES (?,?,?,?,?,?)`
+  ).run(crypto.randomUUID(), sessionId, studentId, status, "tap", tappedAt);
+} else {
+  db.prepare(
+    `UPDATE attendance_records
+     SET status=?, source=?, checked_in_at=?
+     WHERE class_session_id=? AND student_id=?`
+  ).run(status, "tap", tappedAt, sessionId, studentId);
+}
+
+    // Progress
+    const total = db.prepare(`SELECT COUNT(*) as c FROM enrollments WHERE class_id=?`).get(session.class_id).c;
+    const presentOrLate = db.prepare(
+      `SELECT COUNT(*) as c FROM attendance_records WHERE class_session_id=? AND status IN ('present','late')`
+    ).get(sessionId).c;
+
+    bus.emit("attendance_updated", {
+      type: "attendance_updated",
+      sessionId,
+      studentId,
+      attendance: { status, checkedInAt: tappedAt, source: "tap" },
+      progress: { presentOrLate, totalEnrolled: total }
+    });
+  }
+
+  res.json({ ok:true });
 });
 
-// Instructor/Admin manual override
-app.post("/api/attendance/manual", requireAuth, requireRole(["Instructor", "Admin"]), (req, res) => {
-  const { classId, userId, status, note } = req.body || {};
-  if (!classId || !userId) return res.status(400).json({ ok: false, error: "classId and userId required" });
+app.get("/api/health", (req, res) => res.json({ ok:true }));
 
-  const now = new Date().toISOString();
-  const STATUS = String(status || "VERIFIED").toUpperCase();
-
-  db.run(
-    `INSERT INTO attendance_records (class_id, user_id, status, source, ts, note)
-     VALUES (?, ?, ?, 'MANUAL', ?, ?)`,
-    [classId, userId, STATUS, now, note || "Manual override"],
-    function (err) {
-      if (err) return res.status(500).json({ ok: false, error: err.message });
-      res.json({ ok: true, attendanceRecordId: this.lastID, ts: now });
-    }
-  );
-});
-
-// Student attendance history
-app.get("/api/attendance/me", requireAuth, requireRole(["Student"]), (req, res) => {
-  db.all(
-    `SELECT a.id, a.status, a.source, a.ts, a.note, c.org_code, c.class_code, c.title
-     FROM attendance_records a
-     JOIN classes c ON c.id = a.class_id
-     WHERE a.user_id = ?
-     ORDER BY a.ts DESC
-     LIMIT 50`,
-    [req.user.id],
-    (err, rows) => {
-      if (err) return res.status(500).json({ ok: false, error: err.message });
-      res.json({ ok: true, records: rows });
-    }
-  );
-});
-
-app.listen(PORT, () => {
-  console.log(`TouchPoint backend running on http://localhost:${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`TouchPoint M3 backend: http://localhost:${PORT}`);
+  console.log(`LAN health: http://192.168.1.180:${PORT}/api/health`);
 });
